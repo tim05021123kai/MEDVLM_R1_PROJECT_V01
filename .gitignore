@@ -1,0 +1,43 @@
+# Python 虛擬環境
+venv/
+venv_new/
+env/
+ENV/
+.venv/
+
+# Python 緩存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyc
+
+# Hugging Face 模型緩存（很大，不要上傳）
+.cache/
+*.bin
+*.safetensors
+models--*/
+hub/
+
+# 系統文件
+.DS_Store
+Thumbs.db
+*.log
+.env
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 大型文件
+*.pth
+*.pt
+*.ckpt
+*.h5
+
+# 輸出目錄
+outputs/
+results/
+logs/

@@ -1,0 +1,4 @@
+modelscope
+torch
+transformers
+Pillow
