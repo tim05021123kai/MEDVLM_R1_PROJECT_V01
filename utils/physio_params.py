@@ -389,14 +389,91 @@ def format_lab_references():
     return "\n".join(lines)
 
 
-def get_context_for_ai_prompt(body_part_code, modality_code=""):
+def get_age_adjusted_notes(body_part_code, age_str=None, sex=None):
+    """
+    Return age/sex-specific adjustment notes for reference parameters.
+
+    Args:
+        body_part_code: DICOM body part code
+        age_str: DICOM PatientAge string (e.g. '065Y', '003M')
+        sex: DICOM PatientSex ('M' or 'F')
+
+    Returns:
+        List of adjustment note strings
+    """
+    notes = []
+    age_years = _parse_age(age_str)
+    code = (body_part_code or "").upper()
+
+    if code in ("CHEST", "THORAX", "LUNG"):
+        if age_years is not None and age_years < 18:
+            notes.append("Pediatric: CTR normal up to 0.55 in infants/children")
+            notes.append("Pediatric: Thymus may mimic mediastinal widening in young children")
+        if age_years is not None and age_years > 65:
+            notes.append("Elderly: Aortic ectasia and calcification may be age-related")
+            notes.append("Elderly: Mild cardiomegaly may be present without pathology")
+
+    if code in ("HEAD", "BRAIN", "SKULL"):
+        if age_years is not None and age_years < 2:
+            notes.append("Infant: Fontanelles may be open; skull sutures not yet fused")
+        if age_years is not None and age_years > 70:
+            notes.append("Elderly: Age-related cortical atrophy and sulcal widening expected")
+            notes.append("Elderly: Mild periventricular white matter changes may be age-related")
+
+    if code in ("ABDOMEN", "LIVER", "KIDNEY", "PELVIS"):
+        if age_years is not None:
+            if age_years < 18:
+                notes.append("Pediatric: Organ sizes differ significantly by age")
+                notes.append("Pediatric: Kidney length ~(6.79 + 0.22 * age) cm")
+            if age_years > 60:
+                notes.append("Elderly: Kidney cortical thinning may be age-related")
+                notes.append("Elderly: Hepatic steatosis prevalence increases with age")
+
+    if code in ("SPINE", "CSPINE", "TSPINE", "LSPINE"):
+        if age_years is not None and age_years > 50:
+            notes.append("Elderly: Degenerative disc disease and osteophytes are common")
+            if sex == "F":
+                notes.append("Post-menopausal female: Increased osteoporosis risk")
+
+    if code in ("KNEE", "HIP", "SHOULDER", "HAND", "FOOT",
+                "EXTREMITY", "WRIST", "ANKLE", "ELBOW", "MUSCULOSKELETAL"):
+        if age_years is not None and age_years < 18:
+            notes.append("Pediatric: Growth plates (physis) are open; do not confuse with fractures")
+        if sex == "F" and age_years is not None and age_years > 50:
+            notes.append("Post-menopausal female: Consider osteoporosis screening (T-score)")
+
+    return notes
+
+
+def _parse_age(age_str):
+    """Parse DICOM PatientAge string (e.g. '065Y', '003M', '010D') to years."""
+    if not age_str or age_str == "N/A":
+        return None
+    age_str = age_str.strip()
+    try:
+        if age_str.upper().endswith("Y"):
+            return int(age_str[:-1])
+        elif age_str.upper().endswith("M"):
+            return int(age_str[:-1]) / 12.0
+        elif age_str.upper().endswith("D"):
+            return int(age_str[:-1]) / 365.0
+        else:
+            return int(age_str)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_context_for_ai_prompt(body_part_code, modality_code="",
+                              age_str=None, sex=None):
     """
     Generate a physiological context string to include in the AI prompt.
-    This helps the AI provide more accurate analysis.
+    Now includes age/sex-adjusted notes when available.
 
     Args:
         body_part_code: DICOM body part code
         modality_code: DICOM modality code
+        age_str: DICOM PatientAge string
+        sex: DICOM PatientSex
 
     Returns:
         String with relevant physiological context for the AI
@@ -405,15 +482,22 @@ def get_context_for_ai_prompt(body_part_code, modality_code=""):
 
     ref = get_reference_for_body_part(body_part_code)
     if ref:
-        context_parts.append(f"檢查部位: {ref['name']}")
-        context_parts.append("相關參考參數:")
+        context_parts.append(f"Body part: {ref['name']}")
+        context_parts.append("Reference parameters:")
         for key, param in ref["parameters"].items():
             normal = param.get("normal", param.get("adult_normal", ""))
             if normal:
-                context_parts.append(f"  - {param['name']}: 正常值 {normal}")
+                context_parts.append(f"  - {param['name']}: normal {normal}")
+
+    # Age/sex-adjusted notes
+    adj_notes = get_age_adjusted_notes(body_part_code, age_str, sex)
+    if adj_notes:
+        context_parts.append("\nAge/sex-specific considerations:")
+        for note in adj_notes:
+            context_parts.append(f"  * {note}")
 
     if modality_code in ("CT",):
-        context_parts.append("\n顯影劑相關實驗室檢查參考:")
+        context_parts.append("\nContrast-related lab references:")
         renal = LAB_REFERENCES.get("renal_function", {})
         for pk, pv in renal.get("parameters", {}).items():
             normal = pv.get("normal", pv.get("male_normal", ""))

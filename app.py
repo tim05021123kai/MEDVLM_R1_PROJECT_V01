@@ -1,18 +1,24 @@
 """
-MedVLM-R1 Medical Image AI Viewer
-A comprehensive medical image analysis system with:
-- DICOM image import (from PACS or manual upload)
-- Virtual AI radiologist for structured radiology report generation
-- Physiological parameter references
-- Grad-CAM interpretability visualization
-- Ollama local VLM support (qwen3-vl, etc.)
-- User-friendly tabbed Gradio GUI
+MedVLM-R1 Medical Image AI Viewer — v2
+Full-featured medical image analysis system:
+- DICOM import (file + PACS), CT windowing, DICOM de-identification
+- Dual backend: Ollama (local VLM) + MedVLM-R1 (HuggingFace)
+- Streaming inference output (token-by-token)
+- Backend-aware CoT prompts, structured output, few-shot examples
+- Medical image preprocessing (auto-contrast, border crop)
+- Multi-image comparison (prior vs current)
+- Confidence scoring
+- Grad-CAM / Attention Rollout / Perturbation Saliency
+- Structured report generation with PDF + FHIR export
+- LRU cache + analysis history
+- Audit trail logging
+- Gradio Session State (multi-user safe)
 """
 
 import gradio as gr
-import torch
 import numpy as np
 import os
+import time
 from PIL import Image
 
 from model.medvlm_loader import load_medvlm_model
@@ -21,29 +27,37 @@ from model.ollama_client import (
     list_ollama_models,
     DEFAULT_OLLAMA_URL,
 )
-from utils.prompt_utils import build_prompt, build_cot_prompt
+from utils.prompt_utils import (
+    build_prompt, build_cot_prompt, build_comparison_prompt,
+    get_fewshot_for_body_part,
+)
 from utils.physio_params import (
     format_reference_params,
     format_lab_references,
     get_context_for_ai_prompt,
     IMAGING_REFERENCE,
 )
-from inference.run_inference import generate_answer, generate_answer_ollama
+from utils.image_utils import preprocess_medical_image
+from utils.cache import InferenceCache, AnalysisHistory
+from utils.audit_logger import AuditLogger
+from utils.export import export_report_to_pdf, export_report_to_fhir
+from inference.run_inference import (
+    generate_answer, generate_answer_stream,
+    generate_answer_ollama, generate_answer_ollama_stream,
+    generate_multi_image_comparison,
+)
 from report.report_generator import RadiologyReportGenerator, generate_ai_radiology_prompt
 from gradcam.gradcam_engine import (
     generate_gradcam_visualization,
+    perturbation_saliency,
     create_side_by_side,
 )
 
-# Conditional DICOM imports
+# Conditional imports
 try:
     from dicom.dicom_handler import (
-        load_dicom_file,
-        dicom_to_pil_image,
-        extract_dicom_metadata,
-        format_metadata_display,
-        get_ct_window_presets,
-        HAS_PYDICOM,
+        load_dicom_file, dicom_to_pil_image, extract_dicom_metadata,
+        format_metadata_display, get_ct_window_presets, HAS_PYDICOM,
     )
 except ImportError:
     HAS_PYDICOM = False
@@ -54,391 +68,490 @@ try:
 except ImportError:
     HAS_PACS = False
 
+try:
+    from utils.dicom_deidentify import deidentify_dicom, deidentify_metadata, get_phi_summary
+    HAS_DEIDENT = True
+except ImportError:
+    HAS_DEIDENT = False
+
 # ---------------------------------------------------------------------------
-# Global state
+# Singletons (thread-safe, read-mostly)
 # ---------------------------------------------------------------------------
-model = None
-processor = None
-current_dicom_ds = None
-current_dicom_metadata = None
-current_image = None
+_model_cache = {"model": None, "processor": None}
 report_gen = RadiologyReportGenerator()
-pacs_client = None
-pacs_query_results = []
+inference_cache = InferenceCache(max_size=100)
+analysis_history = AnalysisHistory(max_entries=200)
+audit_logger = AuditLogger()
 
-# Model backend state
-active_backend = "ollama"  # Default to Ollama since user has it locally
-ollama_model_name = "qwen3-vl"
-ollama_base_url = DEFAULT_OLLAMA_URL
+# Backend config (mutable from UI)
+_backend_cfg = {
+    "active": "ollama",
+    "ollama_model": "qwen3-vl",
+    "ollama_url": DEFAULT_OLLAMA_URL,
+}
 
 
-def load_model():
-    """Load the MedVLM-R1 model (loaded once, cached globally)."""
-    global model, processor
-    if model is None:
-        print("正在載入 MedVLM-R1 模型...")
-        model, processor = load_medvlm_model()
-        print("模型載入完成！")
-    return model, processor
+def _load_model():
+    """Lazy-load MedVLM-R1 (cached globally)."""
+    if _model_cache["model"] is None:
+        print("Loading MedVLM-R1 model...")
+        m, p = load_medvlm_model()
+        _model_cache["model"] = m
+        _model_cache["processor"] = p
+        print("Model loaded!")
+    return _model_cache["model"], _model_cache["processor"]
 
 
 # ===================================================================
-# Model Backend Helpers
+# Backend helpers
 # ===================================================================
 
 def test_ollama_connection(url):
-    """Test Ollama server connection and list models."""
-    global ollama_base_url
-    url = url.strip()
-    if not url:
-        url = DEFAULT_OLLAMA_URL
-    ollama_base_url = url
-
+    url = url.strip() or DEFAULT_OLLAMA_URL
+    _backend_cfg["ollama_url"] = url
     connected, msg = check_ollama_connection(url)
     if connected:
         models = list_ollama_models(url)
-        model_list = "\n".join(f"  - {m}" for m in models) if models else "  (no models found)"
+        model_list = "\n".join(f"  - {m}" for m in models) if models else "  (none)"
         return f"Connected to {url}\n\nAvailable models:\n{model_list}"
     return f"Connection failed: {msg}"
 
 
 def refresh_ollama_models(url):
-    """Refresh the list of available Ollama models."""
     url = url.strip() or DEFAULT_OLLAMA_URL
     models = list_ollama_models(url)
     return gr.update(choices=models, value=models[0] if models else "")
 
 
-def set_backend(backend_choice, selected_ollama_model, ollama_url):
-    """Set the active model backend."""
-    global active_backend, ollama_model_name, ollama_base_url
-    active_backend = backend_choice
-    if selected_ollama_model:
-        ollama_model_name = selected_ollama_model
-    if ollama_url:
-        ollama_base_url = ollama_url.strip()
-
-    if backend_choice == "ollama":
-        return f"Backend: Ollama ({ollama_model_name}) @ {ollama_base_url}"
-    else:
-        return "Backend: MedVLM-R1 (HuggingFace, CPU)"
+def set_backend(choice, selected_model, url):
+    _backend_cfg["active"] = choice
+    if selected_model:
+        _backend_cfg["ollama_model"] = selected_model
+    if url:
+        _backend_cfg["ollama_url"] = url.strip()
+    if choice == "ollama":
+        return f"Backend: Ollama ({_backend_cfg['ollama_model']}) @ {_backend_cfg['ollama_url']}"
+    return "Backend: MedVLM-R1 (HuggingFace)"
 
 
-def run_inference_with_backend(work_image, prompt):
-    """Run inference using the currently active backend."""
-    global active_backend
-
-    if active_backend == "ollama":
+def _run_inference(image, prompt, stream=False):
+    """Run inference with the active backend. Returns string or yields chunks."""
+    backend = _backend_cfg["active"]
+    if backend == "ollama":
+        if stream:
+            return generate_answer_ollama_stream(
+                image, prompt,
+                model_name=_backend_cfg["ollama_model"],
+                base_url=_backend_cfg["ollama_url"],
+            )
         return generate_answer_ollama(
-            image=work_image,
-            prompt=prompt,
-            model_name=ollama_model_name,
-            base_url=ollama_base_url,
+            image, prompt,
+            model_name=_backend_cfg["ollama_model"],
+            base_url=_backend_cfg["ollama_url"],
         )
     else:
-        m, p = load_model()
-        return generate_answer(m, p, work_image, prompt)
+        m, p = _load_model()
+        if stream:
+            return generate_answer_stream(m, p, image, prompt)
+        return generate_answer(m, p, image, prompt)
 
 
-# ===================================================================
-# Tab 1 – Image Import (DICOM + standard images)
-# ===================================================================
-
-def handle_standard_image_upload(image):
-    """Handle standard image upload (JPG/PNG)."""
-    global current_image, current_dicom_ds, current_dicom_metadata
-    if image is None:
-        return None, "請上傳影像 (Please upload an image)"
-    current_image = image
-    current_dicom_ds = None
-    current_dicom_metadata = None
-    return image, "影像載入成功 (Image loaded successfully)"
-
-
-def handle_dicom_upload(file_obj):
-    """Handle DICOM file upload."""
-    global current_image, current_dicom_ds, current_dicom_metadata
-
-    if not HAS_PYDICOM:
-        return (
-            None,
-            "pydicom 未安裝。請執行: pip install pydicom pylibjpeg pylibjpeg-libjpeg",
-            "N/A",
-        )
-
-    if file_obj is None:
-        return None, "請上傳 DICOM 檔案 (.dcm)", ""
-
+def _run_inference_with_fallback(image, prompt):
+    """Try active backend; on failure, try the other backend."""
     try:
-        file_path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
-        ds = load_dicom_file(file_path)
-        current_dicom_ds = ds
+        return _run_inference(image, prompt, stream=False)
+    except Exception as first_err:
+        alt = "medvlm-r1" if _backend_cfg["active"] == "ollama" else "ollama"
+        try:
+            if alt == "ollama":
+                return generate_answer_ollama(
+                    image, prompt,
+                    model_name=_backend_cfg["ollama_model"],
+                    base_url=_backend_cfg["ollama_url"],
+                )
+            else:
+                m, p = _load_model()
+                return generate_answer(m, p, image, prompt)
+        except Exception:
+            raise first_err  # Re-raise original if fallback also fails
+
+
+# ===================================================================
+# Tab 1 — Image Import
+# ===================================================================
+
+def handle_standard_image_upload(image, state):
+    if image is None:
+        return None, "Please upload an image", state
+    state["current_image"] = image
+    state["dicom_ds"] = None
+    state["dicom_metadata"] = None
+    return image, "Image loaded", state
+
+
+def handle_dicom_upload(file_obj, auto_deident, state):
+    if not HAS_PYDICOM:
+        return None, "pydicom not installed", "", state
+    if file_obj is None:
+        return None, "Upload a .dcm file", "", state
+    try:
+        path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+        ds = load_dicom_file(path)
+
+        if auto_deident and HAS_DEIDENT:
+            ds = deidentify_dicom(ds)
 
         metadata = extract_dicom_metadata(ds)
-        current_dicom_metadata = metadata
-        metadata_text = format_metadata_display(metadata)
-
         pil_image = dicom_to_pil_image(ds)
-        current_image = pil_image
 
-        return pil_image, "DICOM 檔案載入成功！", metadata_text
+        # Medical preprocessing
+        modality = metadata.get("series_info", {}).get("modality", "")
+        pil_image = preprocess_medical_image(pil_image, modality=modality)
 
+        state["current_image"] = pil_image
+        state["dicom_ds"] = ds
+        state["dicom_metadata"] = metadata
+
+        return pil_image, "DICOM loaded", format_metadata_display(metadata), state
     except Exception as e:
-        return None, f"DICOM 載入錯誤: {str(e)}", ""
+        return None, f"DICOM error: {e}", "", state
 
 
-def apply_ct_window(preset_name):
-    """Apply a CT windowing preset to the current DICOM image."""
-    global current_image, current_dicom_ds
-
-    if current_dicom_ds is None:
-        return current_image, "請先載入 DICOM 檔案"
-
-    if not HAS_PYDICOM:
-        return current_image, "pydicom 未安裝"
-
+def apply_ct_window(preset_name, state):
+    ds = state.get("dicom_ds")
+    if ds is None:
+        return state.get("current_image"), "Load a DICOM first"
     presets = get_ct_window_presets()
     if preset_name not in presets:
-        return current_image, f"未知的窗位預設: {preset_name}"
-
-    preset = presets[preset_name]
+        return state.get("current_image"), f"Unknown preset: {preset_name}"
+    p = presets[preset_name]
     try:
-        pil_image = dicom_to_pil_image(
-            current_dicom_ds,
-            window_center=preset["center"],
-            window_width=preset["width"],
-        )
-        current_image = pil_image
-        return pil_image, f"已套用 {preset_name} (WC={preset['center']}, WW={preset['width']})"
+        img = dicom_to_pil_image(ds, window_center=p["center"], window_width=p["width"])
+        state["current_image"] = img
+        return img, f"Applied {preset_name}"
     except Exception as e:
-        return current_image, f"窗位調整錯誤: {str(e)}"
+        return state.get("current_image"), str(e)
 
 
-def apply_custom_window(wc, ww):
-    """Apply custom window center/width."""
-    global current_image, current_dicom_ds
-
-    if current_dicom_ds is None:
-        return current_image, "請先載入 DICOM 檔案"
-
-    if not HAS_PYDICOM:
-        return current_image, "pydicom 未安裝"
-
+def apply_custom_window(wc, ww, state):
+    ds = state.get("dicom_ds")
+    if ds is None:
+        return state.get("current_image"), "Load a DICOM first"
     try:
-        pil_image = dicom_to_pil_image(
-            current_dicom_ds,
-            window_center=float(wc),
-            window_width=float(ww),
-        )
-        current_image = pil_image
-        return pil_image, f"自訂窗位: WC={wc}, WW={ww}"
+        img = dicom_to_pil_image(ds, window_center=float(wc), window_width=float(ww))
+        state["current_image"] = img
+        return img, f"Custom WC={wc}, WW={ww}"
     except Exception as e:
-        return current_image, f"窗位調整錯誤: {str(e)}"
+        return state.get("current_image"), str(e)
 
 
 # ===================================================================
-# Tab 2 – PACS Query & Retrieve
+# Tab 2 — PACS
 # ===================================================================
+pacs_client = None
+pacs_query_results = []
+
 
 def pacs_connect(host, port, ae_title, peer_ae_title):
-    """Connect to a PACS server and verify."""
     global pacs_client
-
     if not HAS_PACS:
-        return "pynetdicom 未安裝。請執行: pip install pynetdicom"
-
+        return "pynetdicom not installed"
     try:
-        config = PACSConfig(
-            host=host.strip(),
-            port=int(port),
-            ae_title=ae_title.strip(),
-            peer_ae_title=peer_ae_title.strip(),
-        )
+        config = PACSConfig(host=host.strip(), port=int(port),
+                            ae_title=ae_title.strip(), peer_ae_title=peer_ae_title.strip())
         pacs_client = PACSClient(config)
-        success, message = pacs_client.verify_connection()
-        return pacs_client.get_connection_status_text(success, message)
+        ok, msg = pacs_client.verify_connection()
+        return pacs_client.get_connection_status_text(ok, msg)
     except Exception as e:
-        return f"Connection failed: {str(e)}"
+        return str(e)
 
 
-def pacs_query(patient_name, patient_id, study_date, modality):
-    """Query PACS for studies."""
-    global pacs_client, pacs_query_results
-
+def pacs_query(pn, pid, sd, mod):
+    global pacs_query_results
     if pacs_client is None:
-        return "請先連線到 PACS 伺服器"
-
+        return "Connect to PACS first"
     try:
         results = pacs_client.query_studies(
-            patient_name=patient_name.strip(),
-            patient_id=patient_id.strip(),
-            study_date=study_date.strip(),
-            modality=modality.strip() if modality else "",
-        )
+            patient_name=pn.strip(), patient_id=pid.strip(),
+            study_date=sd.strip(), modality=mod.strip() if mod else "")
         pacs_query_results = results
         return pacs_client.format_query_results_table(results)
     except Exception as e:
-        return f"查詢錯誤: {str(e)}"
+        return str(e)
 
 
-def pacs_retrieve(study_index):
-    """Retrieve a study from PACS by index."""
-    global pacs_client, pacs_query_results, current_image, current_dicom_ds, current_dicom_metadata
-
-    if not HAS_PYDICOM:
-        return None, "pydicom 未安裝", ""
-
+def pacs_retrieve(idx, state):
+    global pacs_query_results
     if pacs_client is None:
-        return None, "請先連線到 PACS 伺服器", ""
-
+        return None, "Connect first", "", state
     try:
-        idx = int(study_index) - 1
-        if idx < 0 or idx >= len(pacs_query_results):
-            return None, f"無效的編號，請輸入 1-{len(pacs_query_results)}", ""
-
-        result = pacs_query_results[idx]
-        success, files, message = pacs_client.retrieve_study(
-            result.study_instance_uid
-        )
-
-        if success and files:
+        i = int(idx) - 1
+        if i < 0 or i >= len(pacs_query_results):
+            return None, f"Enter 1-{len(pacs_query_results)}", "", state
+        result = pacs_query_results[i]
+        ok, files, msg = pacs_client.retrieve_study(result.study_instance_uid)
+        if ok and files:
             ds = load_dicom_file(files[0])
-            current_dicom_ds = ds
             metadata = extract_dicom_metadata(ds)
-            current_dicom_metadata = metadata
-            pil_image = dicom_to_pil_image(ds)
-            current_image = pil_image
-            return pil_image, message, format_metadata_display(metadata)
-        else:
-            return None, message, ""
-
+            img = dicom_to_pil_image(ds)
+            state["current_image"] = img
+            state["dicom_ds"] = ds
+            state["dicom_metadata"] = metadata
+            return img, msg, format_metadata_display(metadata), state
+        return None, msg, "", state
     except Exception as e:
-        return None, f"接收錯誤: {str(e)}", ""
+        return None, str(e), "", state
 
 
 # ===================================================================
-# Tab 3 – AI Virtual Radiologist
+# Tab 3 — AI Virtual Radiologist (streaming)
 # ===================================================================
 
 def run_ai_analysis(image, question, analysis_type, clinical_history,
-                    body_part_override, generate_report_flag):
-    """
-    Run AI analysis on the current image with optional report generation.
-    Yields intermediate status updates for the Gradio interface.
-    """
-    global current_image, current_dicom_metadata
+                    body_part_override, gen_report, enable_fewshot, state):
+    """Streaming AI analysis with cache, history, audit, and error recovery."""
+    work_image = image if image is not None else state.get("current_image")
+    if work_image is None:
+        yield "Please upload an image first", "", "", state
+        return
 
+    if not question.strip():
+        question = "Please analyze this medical image and describe your findings"
+
+    # Check cache
+    cached = inference_cache.get(work_image, question, _backend_cfg["active"])
+    if cached:
+        yield cached, "", "(cached result)", state
+        return
+
+    backend = _backend_cfg["active"]
+    model_label = (f"Ollama ({_backend_cfg['ollama_model']})"
+                   if backend == "ollama" else "MedVLM-R1")
+
+    yield f"Analyzing with {model_label}...", "", "", state
+
+    # Determine body part and metadata
+    meta = state.get("dicom_metadata")
+    body_part = body_part_override.strip().upper() if body_part_override.strip() else None
+    modality = ""
+    age_str = None
+    sex = None
+    if meta:
+        series = meta.get("series_info", {})
+        patient = meta.get("patient_info", {})
+        if not body_part:
+            body_part = series.get("body_part", "")
+        modality = series.get("modality", "")
+        age_str = patient.get("patient_age")
+        sex = patient.get("patient_sex")
+
+    # Physiological context with age/sex adjustment
+    physio_context = ""
+    if body_part:
+        physio_context = get_context_for_ai_prompt(body_part, modality, age_str, sex)
+
+    # Build prompt
+    if analysis_type == "AI Radiology Report":
+        prompt = generate_ai_radiology_prompt(
+            metadata=meta, clinical_history=clinical_history,
+            physio_context=physio_context,
+        )
+    elif analysis_type == "Chain-of-Thought":
+        prompt = build_cot_prompt(question, backend=backend)
+    elif analysis_type == "Simple":
+        prompt = build_prompt(question, template_type="simple")
+    else:
+        prompt = build_prompt(question, template_type="medical")
+        if physio_context:
+            prompt += f"\n\nReference parameters:\n{physio_context}"
+
+    # Add few-shot example if enabled
+    if enable_fewshot and body_part:
+        fewshot = get_fewshot_for_body_part(body_part)
+        if fewshot:
+            prompt = fewshot + "\nNow analyze the provided image:\n" + prompt
+
+    # Streaming inference with error recovery
+    accumulated = ""
     try:
-        work_image = image if image is not None else current_image
-        if work_image is None:
-            yield "請先上傳影像", "", ""
+        stream = _run_inference(work_image, prompt, stream=True)
+        for chunk in stream:
+            accumulated += chunk
+            yield accumulated, "", "", state
+    except Exception as e:
+        # Fallback to other backend
+        try:
+            accumulated = _run_inference_with_fallback(work_image, prompt)
+            model_label += " (fallback)"
+        except Exception as e2:
+            yield f"Error: {e2}", "", "", state
             return
 
-        if not question.strip():
-            question = "請分析這張醫學影像並描述你的發現"
+    # Cache the result
+    inference_cache.put(work_image, question, accumulated, backend)
 
-        backend_label = (
-            f"Ollama ({ollama_model_name})" if active_backend == "ollama"
-            else "MedVLM-R1"
+    # Physio display
+    physio_display = format_reference_params(body_part) if body_part else ""
+
+    # Report generation
+    report_text = ""
+    if gen_report:
+        report_text = report_gen.generate_report(
+            ai_analysis=accumulated,
+            metadata=meta,
+            physio_context=physio_context,
+            clinical_history=clinical_history,
+            backend_name=model_label,
         )
-        yield f"正在使用 {backend_label} 分析影像，請稍候...", "", ""
 
-        # Determine body part for physiological context
-        body_part = body_part_override.strip().upper() if body_part_override.strip() else None
-        if body_part is None and current_dicom_metadata:
-            body_part = current_dicom_metadata.get("series_info", {}).get("body_part", "")
+    # History + Audit
+    analysis_history.add_entry(
+        image_name="uploaded", prompt=question,
+        result=accumulated, backend=model_label,
+    )
+    audit_logger.log_analysis(
+        backend=backend, model_name=_backend_cfg.get("ollama_model", "medvlm-r1"),
+        image_source="upload", prompt_summary=question,
+        result_summary=accumulated[:300], dicom_metadata=meta,
+    )
 
-        modality = ""
-        if current_dicom_metadata:
-            modality = current_dicom_metadata.get("series_info", {}).get("modality", "")
+    yield accumulated, physio_display, report_text, state
 
-        # Get physiological context
-        physio_context = ""
-        if body_part:
-            physio_context = get_context_for_ai_prompt(body_part, modality)
 
-        # Build prompt based on analysis type
-        if analysis_type == "AI放射科報告":
-            prompt = generate_ai_radiology_prompt(
-                metadata=current_dicom_metadata,
-                clinical_history=clinical_history,
-                physio_context=physio_context,
-            )
-        elif analysis_type == "鏈式思考":
-            prompt = build_cot_prompt(question)
-        elif analysis_type == "簡單分析":
-            prompt = build_prompt(question, template_type="simple")
-        else:
-            prompt = build_prompt(question, template_type="medical")
-            if physio_context:
-                prompt += f"\n\n相關生理參考參數:\n{physio_context}"
+# ===================================================================
+# Tab 3b — Multi-Image Comparison
+# ===================================================================
 
-        # Generate AI analysis using the active backend
-        ai_result = run_inference_with_backend(work_image, prompt)
-
-        # Physio reference display
-        physio_display = ""
-        if body_part:
-            physio_display = format_reference_params(body_part)
-
-        # Generate structured report if requested
-        report_text = ""
-        if generate_report_flag:
-            report_text = report_gen.generate_report(
-                ai_analysis=ai_result,
-                metadata=current_dicom_metadata,
-                physio_context=physio_context,
-                clinical_history=clinical_history,
-            )
-
-        yield ai_result, physio_display, report_text
-
+def run_comparison(prior_image, current_image, clinical_context, state):
+    if prior_image is None or current_image is None:
+        return "Please upload both prior and current images"
+    prompt = build_comparison_prompt(clinical_context)
+    try:
+        result = generate_multi_image_comparison(
+            images=[prior_image, current_image], prompt=prompt,
+            model_name=_backend_cfg["ollama_model"],
+            base_url=_backend_cfg["ollama_url"],
+        )
+        return result
     except Exception as e:
-        yield f"錯誤: {str(e)}", "", ""
+        return f"Comparison error: {e}"
 
 
 # ===================================================================
-# Tab 4 – Grad-CAM Interpretability
+# Tab 4 — Interpretability
 # ===================================================================
 
-def run_gradcam(image, prompt_text):
-    """Generate Grad-CAM visualization (MedVLM-R1 only — requires local model weights)."""
-    global current_image
+def run_gradcam(image, prompt_text, method, state):
+    try:
+        m, p = _load_model()
+        work_image = image if image is not None else state.get("current_image")
+        if work_image is None:
+            return None, None, "Upload an image first"
+        if not prompt_text.strip():
+            prompt_text = "Analyze this medical image"
+        overlay, description = generate_gradcam_visualization(
+            m, p, work_image, prompt_text, method=method)
+        side = create_side_by_side(work_image, overlay)
+        return overlay, side, description
+    except Exception as e:
+        return None, None, f"Error: {e}"
+
+
+def run_perturbation_saliency(image, prompt_text, grid_size, state):
+    """Perturbation saliency — works with Ollama too."""
+    work_image = image if image is not None else state.get("current_image")
+    if work_image is None:
+        return None, None, "Upload an image first"
+    if not prompt_text.strip():
+        prompt_text = "Analyze this medical image"
+
+    def inference_fn(img, pmt):
+        return _run_inference_with_fallback(img, pmt)
 
     try:
-        m, p = load_model()
-
-        work_image = image if image is not None else current_image
-        if work_image is None:
-            return None, None, "請先上傳影像"
-
-        if not prompt_text.strip():
-            prompt_text = "請分析這張醫學影像"
-
-        overlay, description = generate_gradcam_visualization(
-            m, p, work_image, prompt_text
+        _, overlay = perturbation_saliency(
+            work_image, prompt_text, inference_fn, grid_size=int(grid_size))
+        side = create_side_by_side(work_image, overlay)
+        return overlay, side, (
+            f"Perturbation Saliency ({int(grid_size)}x{int(grid_size)} grid):\n"
+            f"  Backend: {_backend_cfg['active']}\n"
+            f"  Red/yellow = regions critical to the analysis\n"
+            f"  Gray masking was applied to each grid cell\n"
+            f"  Response change was measured to determine importance."
         )
-
-        side_by_side = create_side_by_side(work_image, overlay)
-
-        return overlay, side_by_side, description
-
     except Exception as e:
-        return None, None, f"Grad-CAM 錯誤: {str(e)}"
+        return None, None, f"Error: {e}"
 
 
 # ===================================================================
-# Tab 5 – Reference Parameters
+# Tab 5 — Reference
 # ===================================================================
 
-def show_body_part_reference(body_part_key):
-    """Show reference parameters for a selected body part."""
-    return format_reference_params(body_part_key)
-
+def show_body_part_reference(key):
+    return format_reference_params(key)
 
 def show_lab_references():
-    """Show lab reference values."""
     return format_lab_references()
+
+
+# ===================================================================
+# Tab 6 — History / Export / Audit
+# ===================================================================
+
+def show_history():
+    return analysis_history.format_history_display()
+
+
+def show_audit_log():
+    return audit_logger.format_log_display()
+
+
+def export_pdf(state):
+    report = state.get("last_report", "")
+    if not report:
+        return "No report to export"
+    path = export_report_to_pdf(report)
+    return f"Exported to: {path}"
+
+
+def export_fhir(state):
+    result = state.get("last_result", "")
+    meta = state.get("dicom_metadata")
+    if not result:
+        return "No analysis to export"
+    path = export_report_to_fhir(result, metadata=meta)
+    return f"Exported to: {path}"
+
+
+def clear_cache():
+    inference_cache.clear()
+    return f"Cache cleared (was {inference_cache.size} entries)"
+
+
+# ===================================================================
+# DICOM De-identification
+# ===================================================================
+
+def check_phi(state):
+    ds = state.get("dicom_ds")
+    if ds is None:
+        return "No DICOM loaded"
+    if not HAS_DEIDENT:
+        return "De-identification module not available"
+    return get_phi_summary(ds)
+
+
+def run_deidentify(state):
+    ds = state.get("dicom_ds")
+    if ds is None:
+        return "No DICOM loaded", state
+    if not HAS_DEIDENT:
+        return "Module not available", state
+    ds = deidentify_dicom(ds)
+    meta = extract_dicom_metadata(ds)
+    state["dicom_ds"] = ds
+    state["dicom_metadata"] = meta
+    return "De-identification complete. PHI removed.", state
 
 
 # ===================================================================
@@ -446,501 +559,304 @@ def show_lab_references():
 # ===================================================================
 
 def create_interface():
-    """Create the full Gradio interface with all tabs."""
-
     css = """
-    .gradio-container {
-        max-width: 1400px !important;
-    }
+    .gradio-container { max-width: 1400px !important; }
     .medical-header {
         text-align: center;
         background: linear-gradient(135deg, #1a3a4a 0%, #2c5364 100%);
-        color: white;
-        padding: 20px;
-        border-radius: 10px;
-        margin-bottom: 15px;
+        color: white; padding: 20px; border-radius: 10px; margin-bottom: 15px;
     }
     .medical-header h1 { color: white; margin: 0; }
     .medical-header p { color: #b0d4e8; margin: 5px 0 0; }
-    .report-output {
-        font-family: 'Courier New', monospace;
-        white-space: pre-wrap;
-        line-height: 1.5;
-    }
-    .backend-box {
-        border: 1px solid #4a9eff;
-        border-radius: 8px;
-        padding: 12px;
-        background: #f0f7ff;
-    }
+    .report-output { font-family: 'Courier New', monospace; white-space: pre-wrap; }
     """
 
-    # Determine CT window preset choices
-    ct_presets = []
-    if HAS_PYDICOM:
-        ct_presets = list(get_ct_window_presets().keys())
-
-    # Pre-fetch Ollama models list
+    ct_presets = list(get_ct_window_presets().keys()) if HAS_PYDICOM else []
     initial_ollama_models = list_ollama_models(DEFAULT_OLLAMA_URL)
 
-    with gr.Blocks(css=css, title="MedVLM-R1 Medical Image AI Viewer") as interface:
+    with gr.Blocks(css=css, title="MedVLM-R1 Medical Image AI Viewer v2") as interface:
 
-        # ---- Header ----
+        # Session state
+        session = gr.State({
+            "current_image": None,
+            "dicom_ds": None,
+            "dicom_metadata": None,
+            "last_report": "",
+            "last_result": "",
+        })
+
+        # Header
         gr.HTML("""
         <div class="medical-header">
-            <h1>MedVLM-R1 Medical Image AI Viewer</h1>
-            <p>DICOM Import | AI Radiologist | Grad-CAM | Ollama VLM Support</p>
+            <h1>MedVLM-R1 Medical Image AI Viewer v2</h1>
+            <p>DICOM | AI Radiologist | Streaming | Multi-Image | Grad-CAM | Ollama</p>
             <p style="font-size:12px; margin-top:8px; color:#ffcccc;">
                 For educational and research purposes only. Not for clinical decision-making.
             </p>
         </div>
         """)
 
-        # ---- Model Backend Selector (always visible at top) ----
+        # Backend selector
         with gr.Accordion("Model Backend Settings", open=True):
             with gr.Row():
-                with gr.Column(scale=1):
-                    backend_radio = gr.Radio(
-                        choices=["ollama", "medvlm-r1"],
-                        value="ollama",
-                        label="AI Backend",
-                        info="Ollama (recommended if running locally) or MedVLM-R1 (HuggingFace)",
-                    )
-                with gr.Column(scale=1):
-                    ollama_url_input = gr.Textbox(
-                        label="Ollama Server URL",
-                        value=DEFAULT_OLLAMA_URL,
-                    )
-                    ollama_test_btn = gr.Button("Test Ollama Connection", variant="secondary")
-                with gr.Column(scale=1):
-                    ollama_model_dropdown = gr.Dropdown(
-                        choices=initial_ollama_models,
-                        value=initial_ollama_models[0] if initial_ollama_models else "",
-                        label="Ollama Model",
-                        allow_custom_value=True,
-                    )
-                    ollama_refresh_btn = gr.Button("Refresh Models", variant="secondary", size="sm")
-
+                backend_radio = gr.Radio(
+                    ["ollama", "medvlm-r1"], value="ollama", label="AI Backend")
+                ollama_url = gr.Textbox(
+                    label="Ollama URL", value=DEFAULT_OLLAMA_URL)
+                ollama_model_dd = gr.Dropdown(
+                    choices=initial_ollama_models,
+                    value=initial_ollama_models[0] if initial_ollama_models else "",
+                    label="Ollama Model", allow_custom_value=True)
             with gr.Row():
-                backend_apply_btn = gr.Button("Apply Backend Settings", variant="primary")
+                ollama_test_btn = gr.Button("Test Connection", variant="secondary")
+                ollama_refresh_btn = gr.Button("Refresh Models", variant="secondary", size="sm")
+                backend_apply_btn = gr.Button("Apply", variant="primary")
                 backend_status = gr.Textbox(
-                    label="Active Backend",
-                    value=f"Backend: Ollama ({initial_ollama_models[0]})" if initial_ollama_models else "Backend: Ollama (no models found — type model name manually)",
-                    interactive=False,
-                )
+                    label="Active Backend", interactive=False,
+                    value=f"Backend: Ollama ({initial_ollama_models[0]})" if initial_ollama_models else "Backend: Ollama")
+            conn_info = gr.Textbox(label="Connection Info", interactive=False, lines=4, visible=False)
 
-            ollama_connection_info = gr.Textbox(
-                label="Ollama Connection Info",
-                interactive=False,
-                lines=4,
-                visible=False,
-            )
+            ollama_test_btn.click(test_ollama_connection, [ollama_url], [conn_info]).then(
+                lambda: gr.update(visible=True), outputs=[conn_info])
+            ollama_refresh_btn.click(refresh_ollama_models, [ollama_url], [ollama_model_dd])
+            backend_apply_btn.click(set_backend, [backend_radio, ollama_model_dd, ollama_url], [backend_status])
 
-            # Backend event bindings
-            ollama_test_btn.click(
-                test_ollama_connection,
-                inputs=[ollama_url_input],
-                outputs=[ollama_connection_info],
-            ).then(lambda: gr.update(visible=True), outputs=[ollama_connection_info])
+        with gr.Tabs():
 
-            ollama_refresh_btn.click(
-                refresh_ollama_models,
-                inputs=[ollama_url_input],
-                outputs=[ollama_model_dropdown],
-            )
-
-            backend_apply_btn.click(
-                set_backend,
-                inputs=[backend_radio, ollama_model_dropdown, ollama_url_input],
-                outputs=[backend_status],
-            )
-
-        with gr.Tabs() as tabs:
-
-            # ======================================================
-            # TAB 1 – Image Import
-            # ======================================================
-            with gr.Tab("1. Image Import", id="tab_import"):
-                gr.Markdown("### Import medical images from files (DICOM, JPG, PNG) or PACS network")
-
+            # ==================== TAB 1: Image Import ====================
+            with gr.Tab("1. Image Import"):
                 with gr.Row():
-                    # Left – upload area
-                    with gr.Column(scale=1):
-                        gr.Markdown("#### Standard Image (JPG/PNG)")
-                        std_image_input = gr.Image(
-                            label="Upload Image",
-                            type="pil",
-                            height=350,
-                        )
-                        std_upload_status = gr.Textbox(
-                            label="Status", interactive=False, lines=1
-                        )
-
+                    with gr.Column():
+                        std_img = gr.Image(label="Upload (JPG/PNG)", type="pil", height=350)
+                        std_status = gr.Textbox(label="Status", interactive=False)
                         gr.Markdown("---")
-                        gr.Markdown("#### DICOM File (.dcm)")
-                        dicom_file_input = gr.File(
-                            label="Upload DICOM (.dcm)",
-                            file_types=[".dcm", ".dicom", ".DCM"],
-                        )
-                        dicom_upload_status = gr.Textbox(
-                            label="DICOM Status", interactive=False, lines=1
-                        )
+                        dicom_file = gr.File(label="DICOM (.dcm)", file_types=[".dcm", ".dicom"])
+                        auto_deident = gr.Checkbox(label="Auto de-identify PHI on upload", value=False)
+                        dicom_status = gr.Textbox(label="DICOM Status", interactive=False)
+                    with gr.Column():
+                        preview = gr.Image(label="Preview", height=400, interactive=False)
+                        meta_display = gr.Textbox(label="Metadata", lines=12, interactive=False, show_copy_button=True)
 
-                    # Right – preview + metadata
-                    with gr.Column(scale=1):
-                        gr.Markdown("#### Image Preview")
-                        preview_image = gr.Image(
-                            label="Preview", height=400, interactive=False
-                        )
-
-                        gr.Markdown("#### DICOM Metadata")
-                        metadata_display = gr.Textbox(
-                            label="Metadata",
-                            lines=12,
-                            max_lines=20,
-                            interactive=False,
-                            show_copy_button=True,
-                        )
-
-                # CT Windowing controls
                 with gr.Accordion("CT Window Presets", open=False):
                     with gr.Row():
-                        window_preset = gr.Dropdown(
-                            choices=ct_presets,
-                            label="Window Preset",
-                        )
-                        apply_preset_btn = gr.Button("Apply Preset", variant="secondary")
+                        w_preset = gr.Dropdown(choices=ct_presets, label="Preset")
+                        apply_preset = gr.Button("Apply Preset")
                     with gr.Row():
-                        custom_wc = gr.Number(label="Window Center (WC)", value=40)
-                        custom_ww = gr.Number(label="Window Width (WW)", value=350)
-                        apply_custom_btn = gr.Button("Apply Custom", variant="secondary")
+                        c_wc = gr.Number(label="WC", value=40)
+                        c_ww = gr.Number(label="WW", value=350)
+                        apply_custom = gr.Button("Apply Custom")
 
-                # Event bindings – Image Import
-                std_image_input.change(
-                    handle_standard_image_upload,
-                    inputs=[std_image_input],
-                    outputs=[preview_image, std_upload_status],
-                )
+                with gr.Accordion("DICOM De-identification", open=False):
+                    phi_check_btn = gr.Button("Check PHI Fields")
+                    phi_result = gr.Textbox(label="PHI Summary", interactive=False, lines=6)
+                    deident_btn = gr.Button("Remove PHI", variant="stop")
+                    deident_status = gr.Textbox(label="De-ID Status", interactive=False)
 
-                dicom_file_input.change(
-                    handle_dicom_upload,
-                    inputs=[dicom_file_input],
-                    outputs=[preview_image, dicom_upload_status, metadata_display],
-                )
+                std_img.change(handle_standard_image_upload, [std_img, session], [preview, std_status, session])
+                dicom_file.change(handle_dicom_upload, [dicom_file, auto_deident, session],
+                                  [preview, dicom_status, meta_display, session])
+                apply_preset.click(apply_ct_window, [w_preset, session], [preview, dicom_status])
+                apply_custom.click(apply_custom_window, [c_wc, c_ww, session], [preview, dicom_status])
+                phi_check_btn.click(check_phi, [session], [phi_result])
+                deident_btn.click(run_deidentify, [session], [deident_status, session])
 
-                apply_preset_btn.click(
-                    apply_ct_window,
-                    inputs=[window_preset],
-                    outputs=[preview_image, dicom_upload_status],
-                )
-                apply_custom_btn.click(
-                    apply_custom_window,
-                    inputs=[custom_wc, custom_ww],
-                    outputs=[preview_image, dicom_upload_status],
-                )
-
-            # ======================================================
-            # TAB 2 – PACS Network
-            # ======================================================
-            with gr.Tab("2. PACS Network", id="tab_pacs"):
-                gr.Markdown("### Query and retrieve images from a PACS server via DICOM networking")
-
+            # ==================== TAB 2: PACS ====================
+            with gr.Tab("2. PACS Network"):
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("#### Connection Settings")
-                        pacs_host = gr.Textbox(label="PACS Host", value="127.0.0.1")
-                        pacs_port = gr.Number(label="PACS Port", value=11112, precision=0)
-                        pacs_ae = gr.Textbox(label="Local AE Title", value="MEDVLM_SCU")
-                        pacs_peer_ae = gr.Textbox(label="PACS AE Title", value="PACS_SCP")
-                        pacs_connect_btn = gr.Button("Test Connection", variant="primary")
-                        pacs_connect_status = gr.Textbox(
-                            label="Connection Status",
-                            interactive=False,
-                            lines=4,
-                        )
-
-                    with gr.Column(scale=1):
-                        gr.Markdown("#### Query Studies")
-                        q_patient_name = gr.Textbox(label="Patient Name (supports *)", placeholder="*")
-                        q_patient_id = gr.Textbox(label="Patient ID", placeholder="")
-                        q_study_date = gr.Textbox(
-                            label="Study Date (YYYYMMDD or range)",
-                            placeholder="20240101-20241231",
-                        )
-                        q_modality = gr.Dropdown(
-                            choices=["", "CR", "DX", "CT", "MR", "US", "MG", "NM", "PT"],
-                            label="Modality",
-                        )
-                        pacs_query_btn = gr.Button("Search", variant="primary")
-
-                pacs_results_display = gr.Textbox(
-                    label="Query Results",
-                    lines=10,
-                    max_lines=20,
-                    interactive=False,
-                    show_copy_button=True,
-                )
-
+                    with gr.Column():
+                        gr.Markdown("#### Connection")
+                        p_host = gr.Textbox(label="Host", value="127.0.0.1")
+                        p_port = gr.Number(label="Port", value=11112, precision=0)
+                        p_ae = gr.Textbox(label="Local AE", value="MEDVLM_SCU")
+                        p_peer = gr.Textbox(label="PACS AE", value="PACS_SCP")
+                        p_conn_btn = gr.Button("Test", variant="primary")
+                        p_conn_st = gr.Textbox(label="Status", interactive=False, lines=4)
+                    with gr.Column():
+                        gr.Markdown("#### Query")
+                        qpn = gr.Textbox(label="Patient Name", placeholder="*")
+                        qpid = gr.Textbox(label="Patient ID")
+                        qsd = gr.Textbox(label="Study Date", placeholder="YYYYMMDD")
+                        qmod = gr.Dropdown(["", "CR", "DX", "CT", "MR", "US", "MG"], label="Modality")
+                        p_query_btn = gr.Button("Search", variant="primary")
+                p_results = gr.Textbox(label="Results", lines=10, interactive=False, show_copy_button=True)
                 with gr.Row():
-                    retrieve_index = gr.Number(
-                        label="Study # to Retrieve",
-                        value=1,
-                        precision=0,
-                    )
-                    pacs_retrieve_btn = gr.Button("Retrieve", variant="primary")
-
+                    ret_idx = gr.Number(label="Study #", value=1, precision=0)
+                    p_ret_btn = gr.Button("Retrieve", variant="primary")
                 with gr.Row():
-                    pacs_preview = gr.Image(label="Retrieved Image", height=400, interactive=False)
-                    pacs_metadata = gr.Textbox(
-                        label="Retrieved Metadata", lines=10, interactive=False
-                    )
-                pacs_retrieve_status = gr.Textbox(label="Retrieve Status", interactive=False)
+                    p_preview = gr.Image(label="Retrieved", height=400, interactive=False)
+                    p_meta = gr.Textbox(label="Metadata", lines=10, interactive=False)
+                p_ret_st = gr.Textbox(label="Retrieve Status", interactive=False)
 
-                # PACS event bindings
-                pacs_connect_btn.click(
-                    pacs_connect,
-                    inputs=[pacs_host, pacs_port, pacs_ae, pacs_peer_ae],
-                    outputs=[pacs_connect_status],
-                )
-                pacs_query_btn.click(
-                    pacs_query,
-                    inputs=[q_patient_name, q_patient_id, q_study_date, q_modality],
-                    outputs=[pacs_results_display],
-                )
-                pacs_retrieve_btn.click(
-                    pacs_retrieve,
-                    inputs=[retrieve_index],
-                    outputs=[pacs_preview, pacs_retrieve_status, pacs_metadata],
-                )
+                p_conn_btn.click(pacs_connect, [p_host, p_port, p_ae, p_peer], [p_conn_st])
+                p_query_btn.click(pacs_query, [qpn, qpid, qsd, qmod], [p_results])
+                p_ret_btn.click(pacs_retrieve, [ret_idx, session], [p_preview, p_ret_st, p_meta, session])
 
-            # ======================================================
-            # TAB 3 – AI Virtual Radiologist
-            # ======================================================
-            with gr.Tab("3. AI Radiologist", id="tab_ai"):
-                gr.Markdown("### Virtual AI Radiologist — generates structured radiology reports")
-
+            # ==================== TAB 3: AI Radiologist ====================
+            with gr.Tab("3. AI Radiologist"):
+                gr.Markdown("### AI Virtual Radiologist — streaming analysis with structured reports")
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        ai_image_input = gr.Image(
-                            label="Image (or use imported image from Tab 1)",
-                            type="pil",
-                            height=350,
-                        )
-                        ai_question = gr.Textbox(
-                            label="Question / Prompt",
-                            placeholder="What abnormalities do you see in this image?",
-                            lines=3,
-                            value="請分析這張醫學影像並描述你的發現",
-                        )
-                        ai_analysis_type = gr.Radio(
-                            choices=["標準分析", "簡單分析", "鏈式思考", "AI放射科報告"],
-                            value="AI放射科報告",
-                            label="Analysis Mode",
-                        )
-                        ai_clinical_history = gr.Textbox(
-                            label="Clinical History (optional)",
-                            placeholder="e.g., cough for 2 weeks, fever",
-                            lines=2,
-                        )
-                        ai_body_part = gr.Textbox(
-                            label="Body Part Override (auto-detected from DICOM)",
-                            placeholder="CHEST, HEAD, ABDOMEN, SPINE ...",
-                        )
-                        ai_gen_report = gr.Checkbox(
-                            label="Generate Structured Report",
-                            value=True,
-                        )
-
+                    with gr.Column():
+                        ai_img = gr.Image(label="Image", type="pil", height=350)
+                        ai_q = gr.Textbox(label="Question", lines=3,
+                                          value="Please analyze this medical image and describe your findings")
+                        ai_type = gr.Radio(
+                            ["Standard", "Simple", "Chain-of-Thought", "AI Radiology Report"],
+                            value="AI Radiology Report", label="Mode")
+                        ai_hist = gr.Textbox(label="Clinical History", placeholder="e.g., cough for 2 weeks", lines=2)
+                        ai_bp = gr.Textbox(label="Body Part Override", placeholder="CHEST, HEAD, ABDOMEN...")
                         with gr.Row():
-                            ai_run_btn = gr.Button("Analyze", variant="primary", size="lg")
-                            ai_clear_btn = gr.Button("Clear", variant="secondary")
+                            ai_report_cb = gr.Checkbox(label="Generate Report", value=True)
+                            ai_fewshot_cb = gr.Checkbox(label="Include Few-shot Example", value=True)
+                        with gr.Row():
+                            ai_run = gr.Button("Analyze", variant="primary", size="lg")
+                            ai_clear = gr.Button("Clear")
 
-                        # Example questions
-                        gr.Markdown("#### Example Questions")
-                        example_qs = [
-                            "這張影像有什麼異常？",
-                            "請描述病變的位置和特徵",
-                            "這可能是什麼疾病？",
-                            "建議做哪些進一步檢查？",
-                        ]
-                        for eq in example_qs:
-                            gr.Button(eq, size="sm").click(
-                                lambda q=eq: q, outputs=ai_question
-                            )
+                        gr.Markdown("#### Examples")
+                        for eq in ["What abnormalities do you see?",
+                                   "Describe the location and features of any lesions",
+                                   "What is the likely diagnosis?",
+                                   "What further workup do you recommend?"]:
+                            gr.Button(eq, size="sm").click(lambda q=eq: q, outputs=ai_q)
 
-                    with gr.Column(scale=1):
-                        ai_result_text = gr.Textbox(
-                            label="AI Analysis Result",
-                            lines=15,
-                            max_lines=25,
-                            show_copy_button=True,
-                        )
-                        ai_physio_text = gr.Textbox(
-                            label="Reference Parameters",
-                            lines=8,
-                            max_lines=15,
-                            show_copy_button=True,
-                        )
+                    with gr.Column():
+                        ai_result = gr.Textbox(label="AI Analysis (streaming)", lines=15, show_copy_button=True)
+                        ai_physio = gr.Textbox(label="Reference Parameters", lines=8, show_copy_button=True)
 
-                with gr.Accordion("Structured Radiology Report", open=True):
-                    ai_report_text = gr.Textbox(
-                        label="Report",
-                        lines=25,
-                        max_lines=50,
-                        show_copy_button=True,
-                        elem_classes=["report-output"],
-                    )
+                with gr.Accordion("Structured Report", open=True):
+                    ai_report = gr.Textbox(label="Report", lines=25, show_copy_button=True, elem_classes=["report-output"])
 
-                # AI tab event bindings
-                ai_run_btn.click(
+                ai_run.click(
                     run_ai_analysis,
-                    inputs=[
-                        ai_image_input, ai_question, ai_analysis_type,
-                        ai_clinical_history, ai_body_part, ai_gen_report,
-                    ],
-                    outputs=[ai_result_text, ai_physio_text, ai_report_text],
-                )
+                    [ai_img, ai_q, ai_type, ai_hist, ai_bp, ai_report_cb, ai_fewshot_cb, session],
+                    [ai_result, ai_physio, ai_report, session])
+                ai_clear.click(lambda: (None, "", "", "", ""),
+                               outputs=[ai_img, ai_result, ai_physio, ai_report, ai_q])
 
-                def clear_ai():
-                    return None, "", "", "", ""
-
-                ai_clear_btn.click(
-                    clear_ai,
-                    outputs=[ai_image_input, ai_result_text, ai_physio_text,
-                             ai_report_text, ai_question],
-                )
-
-            # ======================================================
-            # TAB 4 – Grad-CAM
-            # ======================================================
-            with gr.Tab("4. Grad-CAM", id="tab_gradcam"):
-                gr.Markdown(
-                    "### Grad-CAM Visualization — understand which image regions the AI focused on\n"
-                    "*Note: Grad-CAM requires loading the MedVLM-R1 model (even if Ollama is the active backend).*"
-                )
-
+            # ==================== TAB 3b: Multi-Image Comparison ====================
+            with gr.Tab("3b. Comparison"):
+                gr.Markdown("### Multi-Image Comparison (Prior vs Current)")
+                gr.Markdown("*Requires Ollama with a vision model that supports multiple images (e.g. qwen3-vl)*")
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        gc_image_input = gr.Image(
-                            label="Image (or use imported image from Tab 1)",
-                            type="pil",
-                            height=350,
-                        )
-                        gc_prompt = gr.Textbox(
-                            label="Analysis Prompt",
-                            value="請分析這張醫學影像並描述你的發現",
-                            lines=2,
-                        )
-                        gc_run_btn = gr.Button(
-                            "Generate Grad-CAM", variant="primary", size="lg"
-                        )
+                    comp_prior = gr.Image(label="Prior Study", type="pil", height=300)
+                    comp_current = gr.Image(label="Current Study", type="pil", height=300)
+                comp_ctx = gr.Textbox(label="Clinical Context", placeholder="e.g., follow-up after treatment")
+                comp_btn = gr.Button("Compare", variant="primary")
+                comp_result = gr.Textbox(label="Comparison Result", lines=20, show_copy_button=True)
 
-                    with gr.Column(scale=1):
-                        gc_overlay = gr.Image(
-                            label="Grad-CAM Heatmap Overlay",
-                            height=350,
-                            interactive=False,
-                        )
+                comp_btn.click(run_comparison, [comp_prior, comp_current, comp_ctx, session], [comp_result])
 
-                gc_side_by_side = gr.Image(
-                    label="Side-by-Side: Original vs Grad-CAM",
-                    height=400,
-                    interactive=False,
-                )
-                gc_description = gr.Textbox(
-                    label="Grad-CAM Analysis Description",
-                    lines=8,
-                    interactive=False,
-                    show_copy_button=True,
-                )
+            # ==================== TAB 4: Interpretability ====================
+            with gr.Tab("4. Interpretability"):
+                gr.Markdown("### Model Attention Visualization")
+                with gr.Tabs():
+                    with gr.Tab("Grad-CAM / Attention Rollout"):
+                        gr.Markdown("*Requires MedVLM-R1 model loaded*")
+                        with gr.Row():
+                            with gr.Column():
+                                gc_img = gr.Image(label="Image", type="pil", height=350)
+                                gc_prompt = gr.Textbox(label="Prompt", value="Analyze this medical image", lines=2)
+                                gc_method = gr.Radio(
+                                    ["auto", "attention_rollout", "gradcam"],
+                                    value="auto", label="Method")
+                                gc_run = gr.Button("Generate", variant="primary")
+                            with gr.Column():
+                                gc_overlay = gr.Image(label="Heatmap", height=350, interactive=False)
+                        gc_side = gr.Image(label="Side-by-Side", height=400, interactive=False)
+                        gc_desc = gr.Textbox(label="Description", lines=8, interactive=False, show_copy_button=True)
+                        gc_run.click(run_gradcam, [gc_img, gc_prompt, gc_method, session],
+                                     [gc_overlay, gc_side, gc_desc])
+
+                    with gr.Tab("Perturbation Saliency"):
+                        gr.Markdown("*Works with ANY backend (Ollama included) — slower but model-agnostic*")
+                        with gr.Row():
+                            with gr.Column():
+                                ps_img = gr.Image(label="Image", type="pil", height=350)
+                                ps_prompt = gr.Textbox(label="Prompt", value="Analyze this medical image", lines=2)
+                                ps_grid = gr.Slider(3, 10, value=5, step=1, label="Grid Size (NxN)")
+                                ps_run = gr.Button("Generate Saliency Map", variant="primary")
+                            with gr.Column():
+                                ps_overlay = gr.Image(label="Saliency", height=350, interactive=False)
+                        ps_side = gr.Image(label="Side-by-Side", height=400, interactive=False)
+                        ps_desc = gr.Textbox(label="Description", lines=6, interactive=False, show_copy_button=True)
+                        ps_run.click(run_perturbation_saliency, [ps_img, ps_prompt, ps_grid, session],
+                                     [ps_overlay, ps_side, ps_desc])
 
                 gr.Markdown("""
-                **How to interpret:**
-                - **Red / Yellow** = High attention areas — the AI focused most here
-                - **Blue / Green** = Low attention areas
-                - Helps verify the AI is looking at clinically relevant regions
+                **Interpretation guide:**
+                - **Red/Yellow** = High attention (model focused here)
+                - **Blue/Green** = Low attention
+                - Verify the AI examines clinically relevant regions
                 """)
 
-                gc_run_btn.click(
-                    run_gradcam,
-                    inputs=[gc_image_input, gc_prompt],
-                    outputs=[gc_overlay, gc_side_by_side, gc_description],
-                )
-
-            # ======================================================
-            # TAB 5 – Reference Parameters
-            # ======================================================
-            with gr.Tab("5. Reference", id="tab_reference"):
-                gr.Markdown("### Physiological & Imaging Reference Parameters")
-
+            # ==================== TAB 5: Reference ====================
+            with gr.Tab("5. Reference"):
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        gr.Markdown("#### Select Body Part")
-                        ref_body_part = gr.Dropdown(
-                            choices=list(IMAGING_REFERENCE.keys()),
-                            label="Body Part",
-                            value="CHEST",
-                        )
-                        ref_show_btn = gr.Button("Show Parameters", variant="primary")
-                        ref_lab_btn = gr.Button("Show Lab References", variant="secondary")
-
+                    with gr.Column():
+                        ref_bp = gr.Dropdown(choices=list(IMAGING_REFERENCE.keys()),
+                                             label="Body Part", value="CHEST")
+                        ref_show = gr.Button("Show Parameters", variant="primary")
+                        ref_lab = gr.Button("Show Lab References")
                     with gr.Column(scale=2):
-                        ref_display = gr.Textbox(
-                            label="Reference Parameters",
-                            lines=25,
-                            max_lines=40,
-                            show_copy_button=True,
-                            interactive=False,
-                        )
+                        ref_display = gr.Textbox(label="Reference", lines=25, interactive=False, show_copy_button=True)
+                ref_show.click(show_body_part_reference, [ref_bp], [ref_display])
+                ref_lab.click(show_lab_references, outputs=[ref_display])
 
-                ref_show_btn.click(
-                    show_body_part_reference,
-                    inputs=[ref_body_part],
-                    outputs=[ref_display],
-                )
-                ref_lab_btn.click(
-                    show_lab_references,
-                    outputs=[ref_display],
-                )
+            # ==================== TAB 6: History / Export / Audit ====================
+            with gr.Tab("6. History & Export"):
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("#### Analysis History")
+                        hist_btn = gr.Button("Show History")
+                        hist_display = gr.Textbox(label="History", lines=20, interactive=False, show_copy_button=True)
+                        hist_btn.click(show_history, outputs=[hist_display])
 
-        # ---- Footer ----
+                    with gr.Column():
+                        gr.Markdown("#### Export")
+                        pdf_btn = gr.Button("Export Report as PDF")
+                        pdf_status = gr.Textbox(label="PDF Export", interactive=False)
+                        fhir_btn = gr.Button("Export as FHIR JSON")
+                        fhir_status = gr.Textbox(label="FHIR Export", interactive=False)
+                        pdf_btn.click(export_pdf, [session], [pdf_status])
+                        fhir_btn.click(export_fhir, [session], [fhir_status])
+
+                with gr.Accordion("Audit Trail", open=False):
+                    audit_btn = gr.Button("Show Audit Log")
+                    audit_display = gr.Textbox(label="Audit Log", lines=15, interactive=False, show_copy_button=True)
+                    audit_btn.click(show_audit_log, outputs=[audit_display])
+
+                with gr.Accordion("Cache Management", open=False):
+                    cache_btn = gr.Button("Clear Inference Cache")
+                    cache_status = gr.Textbox(label="Cache", interactive=False)
+                    cache_btn.click(clear_cache, outputs=[cache_status])
+
         gr.Markdown("""
         ---
-        **MedVLM-R1 Medical Image AI Viewer** | Backends: Ollama (local) + MedVLM-R1 (HuggingFace)
-        | For educational & research purposes only
+        **MedVLM-R1 Medical Image AI Viewer v2** | Ollama + MedVLM-R1 | For educational & research purposes only
         """)
 
     return interface
 
 
 # ===================================================================
-# Main entry point
+# Main
 # ===================================================================
 
 def main():
-    """Launch the application."""
     print("=" * 60)
-    print("  MedVLM-R1 Medical Image AI Viewer")
-    print("  Starting Gradio interface...")
+    print("  MedVLM-R1 Medical Image AI Viewer v2")
     print("=" * 60)
 
-    # Check Ollama availability on startup
     connected, msg = check_ollama_connection(DEFAULT_OLLAMA_URL)
     if connected:
         models = list_ollama_models(DEFAULT_OLLAMA_URL)
-        print(f"Ollama connected! Available models: {models}")
+        print(f"Ollama connected. Models: {models}")
     else:
         print(f"Ollama not available: {msg}")
-        print("You can still use MedVLM-R1 backend or connect Ollama later.")
 
     interface = create_interface()
-
     interface.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        share=False,
-        debug=True,
-        show_error=True,
+        server_name="127.0.0.1", server_port=7860,
+        share=False, debug=True, show_error=True,
     )
 
 

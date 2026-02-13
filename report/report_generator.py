@@ -62,7 +62,8 @@ class RadiologyReportGenerator:
 
     def generate_report(self, ai_analysis, metadata=None, physio_context=None,
                         clinical_history="", template_type="standard",
-                        comparison_studies="", additional_notes=""):
+                        comparison_studies="", additional_notes="",
+                        backend_name="MedVLM-R1", confidence=None):
         """
         Generate a complete radiology report.
 
@@ -135,8 +136,13 @@ class RadiologyReportGenerator:
             report_lines.append("-" * 50)
             report_lines.append(additional_notes)
 
+        # Confidence
+        if confidence is not None:
+            report_lines.append(f"【AI Confidence: {confidence:.0%}】")
+            report_lines.append("")
+
         # Signature
-        report_lines.extend(self._build_signature(now))
+        report_lines.extend(self._build_signature(now, backend_name))
 
         # Disclaimer
         report_lines.extend(self._build_disclaimer())
@@ -296,13 +302,13 @@ class RadiologyReportGenerator:
         lines.append("")
         return lines
 
-    def _build_signature(self, now):
+    def _build_signature(self, now, backend_name="MedVLM-R1"):
         lines = []
         lines.append("【簽章 Signature】")
         lines.append("-" * 50)
-        lines.append(f"  報告產生系統: MedVLM-R1 AI 虛擬放射科醫師")
+        lines.append(f"  報告產生系統: AI 虛擬放射科醫師")
         lines.append(f"  報告時間:     {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        lines.append(f"  AI Model:     MedVLM-R1 (JZPeterPan/MedVLM-R1)")
+        lines.append(f"  AI Model:     {backend_name}")
         lines.append("")
         return lines
 

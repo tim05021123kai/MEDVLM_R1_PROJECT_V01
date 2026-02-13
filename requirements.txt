@@ -16,3 +16,6 @@ pynetdicom
 
 # Numerical / scientific
 numpy
+
+# PDF export (optional — falls back to .txt if not installed)
+reportlab
