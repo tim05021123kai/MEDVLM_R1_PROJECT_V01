@@ -1,43 +1,52 @@
-# Python 虛擬環境
+# Python virtual environments
 venv/
 venv_new/
 env/
 ENV/
 .venv/
 
-# Python 緩存文件
+# Python cache files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 *.pyc
 
-# Hugging Face 模型緩存（很大，不要上傳）
+# Hugging Face model cache (large, do not upload)
 .cache/
 *.bin
 *.safetensors
 models--*/
 hub/
 
-# 系統文件
+# System files
 .DS_Store
 Thumbs.db
 *.log
 .env
 
-# IDE 文件
+# IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# 大型文件
+# Large model files
 *.pth
 *.pt
 *.ckpt
 *.h5
 
-# 輸出目錄
+# Output directories
 outputs/
 results/
 logs/
+
+# DICOM retrieved files
+dicom_retrieved/
+*.dcm
+
+# Temporary files
+tmp/
+temp/
+*.tmp
