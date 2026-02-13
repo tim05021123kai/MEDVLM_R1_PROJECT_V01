@@ -5,6 +5,7 @@ A comprehensive medical image analysis system with:
 - Virtual AI radiologist for structured radiology report generation
 - Physiological parameter references
 - Grad-CAM interpretability visualization
+- Ollama local VLM support (qwen3-vl, etc.)
 - User-friendly tabbed Gradio GUI
 """
 
@@ -15,6 +16,11 @@ import os
 from PIL import Image
 
 from model.medvlm_loader import load_medvlm_model
+from model.ollama_client import (
+    check_ollama_connection,
+    list_ollama_models,
+    DEFAULT_OLLAMA_URL,
+)
 from utils.prompt_utils import build_prompt, build_cot_prompt
 from utils.physio_params import (
     format_reference_params,
@@ -22,7 +28,7 @@ from utils.physio_params import (
     get_context_for_ai_prompt,
     IMAGING_REFERENCE,
 )
-from inference.run_inference import generate_answer
+from inference.run_inference import generate_answer, generate_answer_ollama
 from report.report_generator import RadiologyReportGenerator, generate_ai_radiology_prompt
 from gradcam.gradcam_engine import (
     generate_gradcam_visualization,
@@ -60,6 +66,11 @@ report_gen = RadiologyReportGenerator()
 pacs_client = None
 pacs_query_results = []
 
+# Model backend state
+active_backend = "ollama"  # Default to Ollama since user has it locally
+ollama_model_name = "qwen3-vl"
+ollama_base_url = DEFAULT_OLLAMA_URL
+
 
 def load_model():
     """Load the MedVLM-R1 model (loaded once, cached globally)."""
@@ -69,6 +80,64 @@ def load_model():
         model, processor = load_medvlm_model()
         print("模型載入完成！")
     return model, processor
+
+
+# ===================================================================
+# Model Backend Helpers
+# ===================================================================
+
+def test_ollama_connection(url):
+    """Test Ollama server connection and list models."""
+    global ollama_base_url
+    url = url.strip()
+    if not url:
+        url = DEFAULT_OLLAMA_URL
+    ollama_base_url = url
+
+    connected, msg = check_ollama_connection(url)
+    if connected:
+        models = list_ollama_models(url)
+        model_list = "\n".join(f"  - {m}" for m in models) if models else "  (no models found)"
+        return f"Connected to {url}\n\nAvailable models:\n{model_list}"
+    return f"Connection failed: {msg}"
+
+
+def refresh_ollama_models(url):
+    """Refresh the list of available Ollama models."""
+    url = url.strip() or DEFAULT_OLLAMA_URL
+    models = list_ollama_models(url)
+    return gr.update(choices=models, value=models[0] if models else "")
+
+
+def set_backend(backend_choice, selected_ollama_model, ollama_url):
+    """Set the active model backend."""
+    global active_backend, ollama_model_name, ollama_base_url
+    active_backend = backend_choice
+    if selected_ollama_model:
+        ollama_model_name = selected_ollama_model
+    if ollama_url:
+        ollama_base_url = ollama_url.strip()
+
+    if backend_choice == "ollama":
+        return f"Backend: Ollama ({ollama_model_name}) @ {ollama_base_url}"
+    else:
+        return "Backend: MedVLM-R1 (HuggingFace, CPU)"
+
+
+def run_inference_with_backend(work_image, prompt):
+    """Run inference using the currently active backend."""
+    global active_backend
+
+    if active_backend == "ollama":
+        return generate_answer_ollama(
+            image=work_image,
+            prompt=prompt,
+            model_name=ollama_model_name,
+            base_url=ollama_base_url,
+        )
+    else:
+        m, p = load_model()
+        return generate_answer(m, p, work_image, prompt)
 
 
 # ===================================================================
@@ -260,8 +329,6 @@ def run_ai_analysis(image, question, analysis_type, clinical_history,
     global current_image, current_dicom_metadata
 
     try:
-        m, p = load_model()
-
         work_image = image if image is not None else current_image
         if work_image is None:
             yield "請先上傳影像", "", ""
@@ -270,7 +337,11 @@ def run_ai_analysis(image, question, analysis_type, clinical_history,
         if not question.strip():
             question = "請分析這張醫學影像並描述你的發現"
 
-        yield "正在分析影像，請稍候...", "", ""
+        backend_label = (
+            f"Ollama ({ollama_model_name})" if active_backend == "ollama"
+            else "MedVLM-R1"
+        )
+        yield f"正在使用 {backend_label} 分析影像，請稍候...", "", ""
 
         # Determine body part for physiological context
         body_part = body_part_override.strip().upper() if body_part_override.strip() else None
@@ -302,8 +373,8 @@ def run_ai_analysis(image, question, analysis_type, clinical_history,
             if physio_context:
                 prompt += f"\n\n相關生理參考參數:\n{physio_context}"
 
-        # Generate AI analysis
-        ai_result = generate_answer(m, p, work_image, prompt)
+        # Generate AI analysis using the active backend
+        ai_result = run_inference_with_backend(work_image, prompt)
 
         # Physio reference display
         physio_display = ""
@@ -331,7 +402,7 @@ def run_ai_analysis(image, question, analysis_type, clinical_history,
 # ===================================================================
 
 def run_gradcam(image, prompt_text):
-    """Generate Grad-CAM visualization."""
+    """Generate Grad-CAM visualization (MedVLM-R1 only — requires local model weights)."""
     global current_image
 
     try:
@@ -396,6 +467,12 @@ def create_interface():
         white-space: pre-wrap;
         line-height: 1.5;
     }
+    .backend-box {
+        border: 1px solid #4a9eff;
+        border-radius: 8px;
+        padding: 12px;
+        background: #f0f7ff;
+    }
     """
 
     # Determine CT window preset choices
@@ -403,18 +480,80 @@ def create_interface():
     if HAS_PYDICOM:
         ct_presets = list(get_ct_window_presets().keys())
 
+    # Pre-fetch Ollama models list
+    initial_ollama_models = list_ollama_models(DEFAULT_OLLAMA_URL)
+
     with gr.Blocks(css=css, title="MedVLM-R1 Medical Image AI Viewer") as interface:
 
         # ---- Header ----
         gr.HTML("""
         <div class="medical-header">
             <h1>MedVLM-R1 Medical Image AI Viewer</h1>
-            <p>DICOM Import | AI Radiologist | Grad-CAM Interpretability</p>
+            <p>DICOM Import | AI Radiologist | Grad-CAM | Ollama VLM Support</p>
             <p style="font-size:12px; margin-top:8px; color:#ffcccc;">
                 For educational and research purposes only. Not for clinical decision-making.
             </p>
         </div>
         """)
+
+        # ---- Model Backend Selector (always visible at top) ----
+        with gr.Accordion("Model Backend Settings", open=True):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    backend_radio = gr.Radio(
+                        choices=["ollama", "medvlm-r1"],
+                        value="ollama",
+                        label="AI Backend",
+                        info="Ollama (recommended if running locally) or MedVLM-R1 (HuggingFace)",
+                    )
+                with gr.Column(scale=1):
+                    ollama_url_input = gr.Textbox(
+                        label="Ollama Server URL",
+                        value=DEFAULT_OLLAMA_URL,
+                    )
+                    ollama_test_btn = gr.Button("Test Ollama Connection", variant="secondary")
+                with gr.Column(scale=1):
+                    ollama_model_dropdown = gr.Dropdown(
+                        choices=initial_ollama_models,
+                        value=initial_ollama_models[0] if initial_ollama_models else "",
+                        label="Ollama Model",
+                        allow_custom_value=True,
+                    )
+                    ollama_refresh_btn = gr.Button("Refresh Models", variant="secondary", size="sm")
+
+            with gr.Row():
+                backend_apply_btn = gr.Button("Apply Backend Settings", variant="primary")
+                backend_status = gr.Textbox(
+                    label="Active Backend",
+                    value=f"Backend: Ollama ({initial_ollama_models[0]})" if initial_ollama_models else "Backend: Ollama (no models found — type model name manually)",
+                    interactive=False,
+                )
+
+            ollama_connection_info = gr.Textbox(
+                label="Ollama Connection Info",
+                interactive=False,
+                lines=4,
+                visible=False,
+            )
+
+            # Backend event bindings
+            ollama_test_btn.click(
+                test_ollama_connection,
+                inputs=[ollama_url_input],
+                outputs=[ollama_connection_info],
+            ).then(lambda: gr.update(visible=True), outputs=[ollama_connection_info])
+
+            ollama_refresh_btn.click(
+                refresh_ollama_models,
+                inputs=[ollama_url_input],
+                outputs=[ollama_model_dropdown],
+            )
+
+            backend_apply_btn.click(
+                set_backend,
+                inputs=[backend_radio, ollama_model_dropdown, ollama_url_input],
+                outputs=[backend_status],
+            )
 
         with gr.Tabs() as tabs:
 
@@ -676,7 +815,8 @@ def create_interface():
             # ======================================================
             with gr.Tab("4. Grad-CAM", id="tab_gradcam"):
                 gr.Markdown(
-                    "### Grad-CAM Visualization — understand which image regions the AI focused on"
+                    "### Grad-CAM Visualization — understand which image regions the AI focused on\n"
+                    "*Note: Grad-CAM requires loading the MedVLM-R1 model (even if Ollama is the active backend).*"
                 )
 
                 with gr.Row():
@@ -766,7 +906,7 @@ def create_interface():
         # ---- Footer ----
         gr.Markdown("""
         ---
-        **MedVLM-R1 Medical Image AI Viewer** | Model: JZPeterPan/MedVLM-R1
+        **MedVLM-R1 Medical Image AI Viewer** | Backends: Ollama (local) + MedVLM-R1 (HuggingFace)
         | For educational & research purposes only
         """)
 
@@ -784,13 +924,14 @@ def main():
     print("  Starting Gradio interface...")
     print("=" * 60)
 
-    # Pre-load model
-    try:
-        load_model()
-        print("Model pre-loaded successfully!")
-    except Exception as e:
-        print(f"Model pre-load failed: {e}")
-        print("Model will be loaded on first use.")
+    # Check Ollama availability on startup
+    connected, msg = check_ollama_connection(DEFAULT_OLLAMA_URL)
+    if connected:
+        models = list_ollama_models(DEFAULT_OLLAMA_URL)
+        print(f"Ollama connected! Available models: {models}")
+    else:
+        print(f"Ollama not available: {msg}")
+        print("You can still use MedVLM-R1 backend or connect Ollama later.")
 
     interface = create_interface()
 
