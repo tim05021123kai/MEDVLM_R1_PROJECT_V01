@@ -1,4 +1,21 @@
+# Core dependencies
 modelscope
 torch
 transformers
 Pillow
+gradio
+qwen_vl_utils
+
+# DICOM support
+pydicom
+pylibjpeg
+pylibjpeg-libjpeg
+
+# PACS networking
+pynetdicom
+
+# Numerical / scientific
+numpy
+
+# PDF export (optional — falls back to .txt if not installed)
+reportlab
